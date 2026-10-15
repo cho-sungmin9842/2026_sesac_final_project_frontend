@@ -1,0 +1,100 @@
+const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080'
+
+async function request(path) {
+  const response = await fetch(`${BASE_URL}${path}`)
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new Error(body?.message ?? `요청이 실패했습니다 (status ${response.status})`)
+  }
+  return response.json()
+}
+
+// KMDB의 genre 파라미터는 "멜로/로맨스"처럼 "/"가 낀 장르명을 그대로 넘기면 0건으로 매칭에 실패합니다
+// ("/" 앞부분만 보내도 전체 조합과 정확히 같은 결과가 나오는 걸 확인했습니다). 그래서 화면 표시는
+// 전체 이름("멜로/로맨스")을 쓰되, KMDB에 보낼 때만 "/" 앞부분("멜로")으로 잘라서 보냅니다.
+function toKmdbGenreParam(genre) {
+  const slashIndex = genre.indexOf('/')
+  return slashIndex === -1 ? genre : genre.slice(0, slashIndex)
+}
+
+// 러닝타임은 KMDB 검색 파라미터에 없어 백엔드가 직접 걸러주는 우리 쪽 전용 값("under120"/"over120"/
+// "unknown")입니다. 화면 라벨을 그 코드로 바꿔 보냅니다("전체"는 보내지 않음 = 필터 없음).
+const RUNTIME_PARAM_MAP = {
+  '2시간 미만': 'under120',
+  '2시간 이상': 'over120',
+  '정보 없음': 'unknown',
+}
+
+// 개봉연도의 "정보 없음"(개봉일자/제작연도가 둘 다 없어 연도 자체를 알 수 없는 영화)도 러닝타임과
+// 같은 방식으로 "unknown" 코드로 바꿔 보냅니다.
+const YEAR_UNKNOWN_LABEL = '정보 없음'
+
+/**
+ * query가 빈 문자열이면 KMDB 전체 카탈로그를 대상으로 검색합니다(제목 필터 없음).
+ * genre/year는 KMDB가 실제로 지원하는 필터라 서버(KMDB)에서 걸러진 결과가 옵니다.
+ * genre는 문자열 하나 또는 배열(여러 장르 동시 필터, 예: 선호 장르가 여러 개인 경우) 둘 다 받습니다.
+ * runtime은 KMDB에 없는 필터라 백엔드가 응답을 받은 뒤 직접 거르고, totalCount에도 반영해 돌려줍니다.
+ * sort(latest/name)는 KMDB에 정렬 파라미터가 없어서 백엔드가 여러 페이지 분량을 미리 받아와 직접 정렬합니다.
+ * 응답은 { movies, page, pageSize, totalCount, totalPages } 형태입니다.
+ */
+export function searchMovies(query, { genre, year, runtime, sort, page = 1, pageSize = 20, field } = {}) {
+  const params = new URLSearchParams({ query, page, pageSize })
+  const genreList = Array.isArray(genre) ? genre.filter(Boolean) : [genre].filter(Boolean)
+  genreList.forEach((value) => params.append('genre', toKmdbGenreParam(value)))
+  if (year) params.set('year', year === YEAR_UNKNOWN_LABEL ? 'unknown' : year)
+  if (runtime && RUNTIME_PARAM_MAP[runtime]) params.set('runtime', RUNTIME_PARAM_MAP[runtime])
+  if (sort) params.set('sort', sort)
+  if (field) params.set('field', field)
+  return request(`/api/movies?${params.toString()}`)
+}
+
+export function getMovieDetail(id) {
+  return request(`/api/movies/${encodeURIComponent(id)}`)
+}
+
+/**
+ * 장르 필터 사이드바/마이페이지 선호 장르 선택지. 백엔드 MovieGenres.ALL이 유일한 출처라, 프론트에
+ * 장르 목록을 따로 하드코딩해두지 않고 항상 여기서 받아옵니다(한쪽만 바뀌어 어긋나는 일이 없도록).
+ */
+export function getGenres() {
+  return request('/api/movies/genres')
+}
+
+/**
+ * "AI 줄거리 요약 (스포방지)" 버튼용. Gemini가 결말/반전을 뺀 짧은 요약을 만들어 { summary } 형태로 내려줍니다.
+ */
+export function getAiSummary(id) {
+  return request(`/api/movies/${encodeURIComponent(id)}/ai-summary`)
+}
+
+/**
+ * 예매 화면의 "상영중인 영화" 목록. 오늘 기준 최근 4주 내 개봉일자(releaseDts~releaseDte)인 KMDB 영화를 가져옵니다.
+ * listCount 기본값은 날짜마다 달라지는 실제 개봉작 수(KMDB TotalCount)를 자르지 않도록, 백엔드가 한 번에
+ * 받아오는 한도(500)와 동일하게 넉넉히 잡아둡니다 - 실제로는 그보다 훨씬 적은 전체 목록이 그대로 내려옵니다.
+ */
+export function getNowShowing(listCount = 500) {
+  return request(`/api/movies/now-showing?listCount=${listCount}`)
+}
+
+/**
+ * KMDB는 "인기순"/"추천" 개념이 없어서, 제목 목록을 하나씩 검색해 첫 번째 결과만 모아
+ * 화면에 보여줄 진열대를 구성합니다. 검색이 실패하거나 결과가 없는 제목은 건너뜁니다.
+ */
+export async function getFirstMatches(titles) {
+  const results = await Promise.all(
+    titles.map((title) =>
+      searchMovies(title, { pageSize: 1 })
+        .then((result) => result.movies[0] ?? null)
+        .catch(() => null),
+    ),
+  )
+  return results.filter(Boolean)
+}
+
+/**
+ * 홈 화면 "지금 인기 있는 영화". 고정된 제목 목록이 아니라, 실제 사용자 리뷰 평균 평점이
+ * minScore 이상인 영화를 평점순으로 서버에서 직접 조회합니다.
+ */
+export function getPopularMovies(minScore = 4, limit = 6) {
+  return request(`/api/movies/popular?minScore=${minScore}&limit=${limit}`)
+}
