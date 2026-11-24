@@ -6,6 +6,7 @@ import { getWishlist } from '../../api/wishlistApi'
 import { getWatched } from '../../api/watchedApi'
 import { cancelBooking, getMyBookings } from '../../api/bookingApi'
 import { deleteReview, getMyReviews, updateReview } from '../../api/reviewApi'
+import { BASE_URL } from '../../api/httpClient'
 import { changePassword, deleteAccount, getPreferredGenres, updatePreferredGenres } from '../../api/userApi'
 import { getGenres, getNowShowing } from '../../api/movieApi'
 import { genreLabel } from '../MovieList/components/filterOptions'
@@ -21,6 +22,7 @@ import ChangePasswordDialog from './components/ChangePasswordDialog'
 import DeleteAccountDialog from './components/DeleteAccountDialog'
 import ConfirmDialog from '../../components/common/ConfirmDialog'
 import InfoDialog from '../../components/common/InfoDialog'
+import MovieTicketDialog from '../../components/common/MovieTicketDialog'
 
 const TABS = ['예매 내역', '내가 쓴 리뷰', '찜한 영화', '시청완료']
 
@@ -259,7 +261,7 @@ function defaultCalendarMonth(bookings) {
   return { year: now.getFullYear(), monthIndex: now.getMonth() }
 }
 
-function MyBookingList({ bookings, isLoading, onSeatClick, onCancel, emptyMessage }) {
+function MyBookingList({ bookings, isLoading, onSeatClick, onCancel, onViewTicket, emptyMessage }) {
   if (isLoading) {
     return <p className="text-sm text-gray-500">불러오는 중...</p>
   }
@@ -325,8 +327,15 @@ function MyBookingList({ bookings, isLoading, onSeatClick, onCancel, emptyMessag
               </span>
               <span className="font-semibold text-white">{booking.totalPrice.toLocaleString()}원</span>
             </div>
-            {canModify && (
-              <div className="mt-2 flex justify-end">
+            <div className="mt-2 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => onViewTicket(booking)}
+                className="rounded-md bg-slate-800 px-3 py-1.5 text-xs font-semibold text-gray-300 hover:bg-indigo-600 hover:text-white"
+              >
+                🎫 모바일 티켓 보기
+              </button>
+              {canModify && (
                 <button
                   type="button"
                   onClick={() => onCancel(booking)}
@@ -334,8 +343,8 @@ function MyBookingList({ bookings, isLoading, onSeatClick, onCancel, emptyMessag
                 >
                   예매 취소
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         )
       })}
@@ -367,13 +376,23 @@ function MyReviewList({ reviews, onEdit, onDelete }) {
             </span>
           </div>
           <p className="mt-2 text-sm text-gray-300">{review.content}</p>
-          <div className="mt-2 flex justify-end gap-2 text-xs text-gray-400">
-            <button type="button" onClick={() => onEdit(review)} className="hover:text-white">
-              수정
-            </button>
-            <button type="button" onClick={() => onDelete(review)} className="hover:text-red-400">
-              삭제
-            </button>
+          {review.photoUrl && (
+            <img
+              src={`${BASE_URL}${review.photoUrl}`}
+              alt="리뷰 첨부 사진"
+              className="mt-2 max-h-72 max-w-full rounded-lg object-contain"
+            />
+          )}
+          <div className="mt-2 flex items-center justify-between text-xs text-gray-400">
+            <span>👍 도움이 됐어요 {review.helpfulCount ?? 0}명</span>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => onEdit(review)} className="hover:text-white">
+                수정
+              </button>
+              <button type="button" onClick={() => onDelete(review)} className="hover:text-red-400">
+                삭제
+              </button>
+            </div>
           </div>
         </div>
       ))}
@@ -408,6 +427,7 @@ function MyPage() {
   const [savingGenres, setSavingGenres] = useState(false)
   const [showSavedDialog, setShowSavedDialog] = useState(false)
   const [seatMapBooking, setSeatMapBooking] = useState(null)
+  const [ticketBooking, setTicketBooking] = useState(null)
   const [showChangePassword, setShowChangePassword] = useState(false)
   const [showDeleteAccount, setShowDeleteAccount] = useState(false)
   // 선호 장르 선택지 - 백엔드 MovieGenres.ALL이 유일한 출처라 하드코딩해두지 않고 받아옵니다
@@ -484,6 +504,8 @@ function MyPage() {
     )
   }
 
+  const [genreErrorMessage, setGenreErrorMessage] = useState('')
+
   const handleSaveGenres = async () => {
     setSavingGenres(true)
     try {
@@ -492,7 +514,7 @@ function MyPage() {
       setSavedGenres(dto.genres)
       setShowSavedDialog(true)
     } catch (error) {
-      window.alert(error.message)
+      setGenreErrorMessage(error.message)
     } finally {
       setSavingGenres(false)
     }
@@ -710,6 +732,7 @@ function MyPage() {
                   isLoading={bookingsLoading}
                   onSeatClick={setSeatMapBooking}
                   onCancel={handleCancelBooking}
+                  onViewTicket={setTicketBooking}
                   emptyMessage={calendarEmptyMessage}
                 />
               </>
@@ -719,6 +742,7 @@ function MyPage() {
                 isLoading={bookingsLoading}
                 onSeatClick={setSeatMapBooking}
                 onCancel={handleCancelBooking}
+                onViewTicket={setTicketBooking}
                 emptyMessage={bookingEmptyMessage}
               />
             )}
@@ -790,6 +814,8 @@ function MyPage() {
         />
       )}
 
+      {ticketBooking && <MovieTicketDialog booking={ticketBooking} onClose={() => setTicketBooking(null)} />}
+
       {pendingCancelBooking && (
         <ConfirmDialog
           title="예매 취소"
@@ -823,6 +849,10 @@ function MyPage() {
           tone="error"
           onClose={() => setReviewDeleteErrorMessage('')}
         />
+      )}
+
+      {genreErrorMessage && (
+        <InfoDialog title="선호 장르 저장 실패" message={genreErrorMessage} tone="error" onClose={() => setGenreErrorMessage('')} />
       )}
     </div>
   )

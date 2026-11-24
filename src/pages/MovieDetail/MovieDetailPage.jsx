@@ -1,15 +1,25 @@
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../auth/AuthContext'
 import { useWishlist } from '../../wishlist/WishlistContext'
 import { getMovieDetail } from '../../api/movieApi'
-import { addReview, deleteReview, getReviews, updateReview } from '../../api/reviewApi'
+import {
+  addReview,
+  deleteReview,
+  getReviews,
+  removeReviewPhoto,
+  reportReview,
+  toggleReviewHelpful,
+  updateReview,
+  uploadReviewPhoto,
+} from '../../api/reviewApi'
 import { addWatched, isWatched, removeWatched } from '../../api/watchedApi'
 import { recordMovieView } from '../../api/recentlyViewedApi'
 import AiSummaryBox from './components/AiSummaryBox'
 import OtherVideoButtons from './components/OtherVideoButtons'
 import PosterLink from './components/PosterLink'
 import ReviewList from './components/ReviewList'
+import ReviewReportDialog from './components/ReviewReportDialog'
 import StillGallery from './components/StillGallery'
 import WriteReviewDialog from './components/WriteReviewDialog'
 import { normalizeDetail } from './normalizeDetail'
@@ -17,13 +27,26 @@ import ConfirmDialog from '../../components/common/ConfirmDialog'
 import InfoDialog from '../../components/common/InfoDialog'
 import SortDropdown from '../MovieList/components/SortDropdown'
 
+// 백엔드 에러 메시지가 이미 "영화를 찾을 수 없습니다: <id>" 형태라, 화면에 그대로 쓰면 아래 헤딩과
+// 겹쳐서 문구가 두 번 보입니다. 그 접두어를 떼고 상세 내용(영화 id)만 보조 텍스트로 보여줍니다.
+const NOT_FOUND_PREFIX = '영화를 찾을 수 없습니다: '
+
+function stripNotFoundPrefix(message) {
+  return message.startsWith(NOT_FOUND_PREFIX) ? message.slice(NOT_FOUND_PREFIX.length) : message
+}
+
 const REVIEW_SORT_OPTIONS = [
   { value: 'latest', label: '최신순' },
   { value: 'rating', label: '평점순' },
+  { value: 'helpful', label: '추천순' },
 ]
 
 function MovieDetailPage() {
   const { id } = useParams()
+  // 리뷰 "도움이 됐어요" 알림을 눌러 들어오면 ?reviewId=로 어떤 리뷰인지 넘어옵니다 - 리뷰 목록이
+  // 뜨면 그 리뷰까지 스크롤하고 잠깐 하이라이트합니다.
+  const [searchParams] = useSearchParams()
+  const highlightedReviewId = searchParams.get('reviewId')
   const { user } = useAuth()
   const { wishlistedIds, toggle: toggleWishlist } = useWishlist()
   const [status, setStatus] = useState('loading') // loading | ready | error
@@ -36,6 +59,10 @@ function MovieDetailPage() {
   const [pendingDeleteReview, setPendingDeleteReview] = useState(null)
   const [deleteErrorMessage, setDeleteErrorMessage] = useState('')
   const [reviewSort, setReviewSort] = useState('latest')
+  const [pendingReportReview, setPendingReportReview] = useState(null)
+  // 이번 화면 접속 동안 신고 처리된 리뷰 id 모음(새로고침하면 초기화) - ReviewList의 "신고 완료" 표시용.
+  const [reportedReviewIds, setReportedReviewIds] = useState(new Set())
+  const [reportDialog, setReportDialog] = useState(null) // { message, tone }
 
   const wishlisted = wishlistedIds.has(id)
 
@@ -43,7 +70,7 @@ function MovieDetailPage() {
     let cancelled = false
     setStatus('loading')
 
-    Promise.all([getMovieDetail(id), getReviews(id), isWatched(user.id, id)])
+    Promise.all([getMovieDetail(id), getReviews(id, user.id), isWatched(user.id, id)])
       .then(([dto, reviewList, watchedFlag]) => {
         if (cancelled) return
         const normalized = normalizeDetail(dto)
@@ -65,6 +92,14 @@ function MovieDetailPage() {
     }
   }, [id, user.id])
 
+  // 리뷰 목록이 뜨고 나서야 실제 DOM에 해당 리뷰가 존재하므로, status가 ready로 바뀐 뒤에 스크롤합니다.
+  useEffect(() => {
+    if (status !== 'ready' || !highlightedReviewId) return
+    const element = document.getElementById(`review-${highlightedReviewId}`)
+    if (!element) return
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [status, highlightedReviewId])
+
   const handleToggleWishlist = () => {
     toggleWishlist({ id, title: detail.title, posterUrl: detail.posterUrl })
   }
@@ -83,14 +118,29 @@ function MovieDetailPage() {
     }
   }
 
-  const handleReviewSubmit = async ({ score, content }) => {
+  const handleReviewSubmit = async ({ score, content, photoFile, photoRemoved }) => {
     try {
-      if (editingReview) {
-        await updateReview(id, editingReview.id, user.id, { movieTitle: detail.title, score, content })
-      } else {
-        await addReview(id, user.id, { movieTitle: detail.title, score, content })
+      const saved = editingReview
+        ? await updateReview(id, editingReview.id, user.id, { movieTitle: detail.title, score, content })
+        : await addReview(id, user.id, { movieTitle: detail.title, score, content })
+      // 사진은 리뷰 자체가 저장되어 reviewId가 확정된 뒤에야 올리거나 뗄 수 있어서, 필요할 때만 이어서
+      // 호출합니다(실패해도 리뷰 자체는 이미 저장됐으니, 사진 처리만 빠진 상태로 안내하고 넘어갑니다).
+      // photoFile(새 사진)이 photoRemoved(기존 사진 떼기)보다 우선입니다 - 다이얼로그에서 미리보기가
+      // 새 사진으로 바뀐 순간 photoRemoved는 이미 false로 돌아가므로 실제로 겹칠 일은 없습니다.
+      if (photoFile) {
+        try {
+          await uploadReviewPhoto(id, saved.id, user.id, photoFile)
+        } catch (photoError) {
+          window.alert(`리뷰는 저장됐지만 사진 첨부에 실패했습니다: ${photoError.message}`)
+        }
+      } else if (photoRemoved && saved.photoUrl) {
+        try {
+          await removeReviewPhoto(id, saved.id, user.id)
+        } catch (photoError) {
+          window.alert(`리뷰는 저장됐지만 사진 삭제에 실패했습니다: ${photoError.message}`)
+        }
       }
-      setReviews(await getReviews(id))
+      setReviews(await getReviews(id, user.id))
       setDialogOpen(false)
       setEditingReview(null)
     } catch (error) {
@@ -112,7 +162,7 @@ function MovieDetailPage() {
     setPendingDeleteReview(null)
     try {
       await deleteReview(id, review.id, user.id)
-      setReviews(await getReviews(id))
+      setReviews(await getReviews(id, user.id))
     } catch (error) {
       setDeleteErrorMessage(error.message)
     }
@@ -123,12 +173,44 @@ function MovieDetailPage() {
     setEditingReview(null)
   }
 
+  const handleReviewReport = (review) => {
+    setPendingReportReview(review)
+  }
+
+  const confirmReviewReport = async (reasonKey) => {
+    const review = pendingReportReview
+    setPendingReportReview(null)
+    try {
+      await reportReview(id, review.id, user.id, reasonKey)
+      setReportedReviewIds((prev) => new Set(prev).add(review.id))
+      setReportDialog({ message: '신고가 접수되었습니다. 관리자가 확인 후 처리합니다.' })
+    } catch (error) {
+      setReportDialog({ message: error.message, tone: 'error' })
+    }
+  }
+
+  // 리뷰 "도움이 됐어요" - 서버가 토글 결과(갱신된 추천 수/내 추천 여부)를 바로 돌려줘서, 전체
+  // 리뷰 목록을 다시 불러오지 않고 그 리뷰 하나만 로컬 상태에서 갱신합니다.
+  const handleToggleHelpful = async (review) => {
+    try {
+      const { helpfulCount, helpfulByMe } = await toggleReviewHelpful(id, review.id, user.id)
+      setReviews((prev) =>
+        prev.map((candidate) => (candidate.id === review.id ? { ...candidate, helpfulCount, helpfulByMe } : candidate))
+      )
+    } catch (error) {
+      window.alert(error.message)
+    }
+  }
+
   const hasReviewed = reviews.some((review) => review.userId === user?.id)
 
   const sortedReviews = [...reviews].sort((a, b) => {
     if (reviewSort === 'rating') {
       const scoreDiff = (b.score ?? -1) - (a.score ?? -1)
       if (scoreDiff !== 0) return scoreDiff
+    } else if (reviewSort === 'helpful') {
+      const helpfulDiff = (b.helpfulCount ?? 0) - (a.helpfulCount ?? 0)
+      if (helpfulDiff !== 0) return helpfulDiff
     }
     return new Date(b.createdAt) - new Date(a.createdAt)
   })
@@ -144,7 +226,19 @@ function MovieDetailPage() {
   }
 
   if (status === 'error' || !detail) {
-    return <p className="p-6 text-gray-400">영화를 찾을 수 없습니다: {errorMessage}</p>
+    return (
+      <div className="mx-auto flex max-w-md flex-col items-center gap-3 px-6 py-24 text-center">
+        <span className="text-4xl">🎬</span>
+        <h1 className="text-lg font-semibold text-white">영화를 찾을 수 없습니다</h1>
+        <p className="text-sm text-gray-500">{stripNotFoundPrefix(errorMessage)}</p>
+        <Link
+          to="/movies"
+          className="mt-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500"
+        >
+          영화 목록으로 돌아가기
+        </Link>
+      </div>
+    )
   }
 
   return (
@@ -252,6 +346,10 @@ function MovieDetailPage() {
               currentUser={user?.id}
               onEdit={handleReviewEdit}
               onDelete={handleReviewDelete}
+              onReport={handleReviewReport}
+              reportedReviewIds={reportedReviewIds}
+              onToggleHelpful={handleToggleHelpful}
+              highlightedReviewId={highlightedReviewId}
             />
           ) : (
             <p className="text-sm text-gray-500">아직 등록된 리뷰가 없습니다.</p>
@@ -281,6 +379,19 @@ function MovieDetailPage() {
 
       {deleteErrorMessage && (
         <InfoDialog title="리뷰 삭제 실패" message={deleteErrorMessage} tone="error" onClose={() => setDeleteErrorMessage('')} />
+      )}
+
+      {pendingReportReview && (
+        <ReviewReportDialog onConfirm={confirmReviewReport} onCancel={() => setPendingReportReview(null)} />
+      )}
+
+      {reportDialog && (
+        <InfoDialog
+          title={reportDialog.tone === 'error' ? '신고 실패' : '신고 완료'}
+          message={reportDialog.message}
+          tone={reportDialog.tone}
+          onClose={() => setReportDialog(null)}
+        />
       )}
     </div>
   )

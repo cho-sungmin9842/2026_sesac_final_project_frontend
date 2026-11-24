@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../../auth/AuthContext'
 import { getMovieSuggestions, getPersonSuggestions } from '../../api/movieApi'
+import useMediaQuery from '../../hooks/useMediaQuery'
 import NotificationBell from './NotificationBell'
 import ThemeToggle from '../common/ThemeToggle'
 import VersionBadge from '../common/VersionBadge'
@@ -33,12 +34,26 @@ function Header() {
   const navigate = useNavigate()
   const location = useLocation()
   const { user, logout } = useAuth()
+  // Tailwind의 md(768px) breakpoint와 맞춰서, 데스크톱/모바일 중 실제로 보이는 쪽에만
+  // NotificationBell을 마운트합니다(CSS로만 숨기면 둘 다 항상 마운트돼 폴링이 2배로 돕니다).
+  const isDesktop = useMediaQuery('(min-width: 768px)')
   const [searchType, setSearchType] = useState(SEARCH_TYPES[0].value)
   const [searchText, setSearchText] = useState('')
   const [menuOpen, setMenuOpen] = useState(false)
   const [suggestions, setSuggestions] = useState([])
   const [showSuggestions, setShowSuggestions] = useState(false)
+  // 배우/감독 자동완성은 KMDB를 직접 조회해 제목(로컬 캐시)보다 눈에 띄게 느린데, 로딩 표시가
+  // 전혀 없어 사용자가 "멈췄나?" 하고 느낄 수 있다는 피드백이 있어 추가했습니다.
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false)
+  // 방향키(↑/↓)로 하이라이트한 자동완성 항목 번호 - -1이면 아무것도 고르지 않은 상태(Enter는 일반 검색).
+  const [activeIndex, setActiveIndex] = useState(-1)
   const suggestionRequestId = useRef(0)
+  // 방향키/후보 클릭으로 입력창 글자가 프로그램에 의해 바뀌면, 이걸 "새 입력"으로 착각해 후보를 다시
+  // 불러오지 않도록 그 글자를 기억해둡니다(글자가 같을 때만 건너뜀 - 같은 값으로 바꾼 경우에도 건너뛰기
+  // 표시가 남아 다음 입력을 씹는 일이 없도록 불리언 대신 값 비교를 씁니다). typedText는 사용자가 직접 친
+  // 글자(Esc로 되돌릴 때 사용).
+  const programmaticText = useRef(null)
+  const typedText = useRef('')
   const selectedSearchType = SEARCH_TYPES.find((type) => type.value === searchType) ?? SEARCH_TYPES[0]
 
   // Header는 라우트가 바뀌어도 다시 마운트되지 않아서(레이아웃에 고정), 검색 결과 화면(/movies)을 벗어나면
@@ -57,13 +72,30 @@ function Header() {
   // 입력 중일 때마다 바로 요청하지 않고(타이핑할 때마다 서버를 때리는 걸 막기 위해) 잠깐 멈췄을
   // 때만 자동완성을 불러옵니다. 응답이 늦게 와서 이미 다른 글자를 입력한 뒤 도착하는 경우(요청
   // 순서가 뒤바뀌는 경우)를 대비해, 매 요청에 번호를 매겨 가장 최근 요청의 응답만 반영합니다.
+  // 후보 목록이 바뀌거나(새 입력/유형 변경) 닫히면 하이라이트를 초기화합니다.
   useEffect(() => {
+    setActiveIndex(-1)
+  }, [suggestions, showSuggestions])
+
+  useEffect(() => {
+    if (programmaticText.current !== null && programmaticText.current === searchText) {
+      // 이미 날아간 이전 요청의 응답이 뒤늦게 목록을 덮어쓰지 못하게 요청 번호도 올려둡니다.
+      suggestionRequestId.current += 1
+      setSuggestionsLoading(false)
+      return undefined
+    }
     if (!searchText.trim() || !AUTOCOMPLETE_FIELDS.has(searchType)) {
       setSuggestions([])
+      setSuggestionsLoading(false)
       return undefined
     }
     const requestId = ++suggestionRequestId.current
     const timer = setTimeout(() => {
+      // showSuggestions도 여기서 같이 켜야 로딩 표시가 보입니다 - 원래 이 플래그는 응답이 와야(.then
+      // 안에서) 켜졌는데, 그러면 "검색 중..." 문구를 그리는 조건(showSuggestions && ...) 자체가
+      // 응답 전까지 항상 false라 로딩 표시가 뜰 기회가 없었습니다.
+      setSuggestionsLoading(true)
+      setShowSuggestions(true)
       // 제목은 영화 카드(id/title/year)를, 배우/감독은 "사람 이름" 문자열만 돌려받습니다 - 두 응답이
       // 서로 다른 모양이라, 아래 렌더링/클릭 처리도 searchType으로 나눠서 다룹니다.
       const fetchSuggestions =
@@ -73,12 +105,29 @@ function Header() {
           if (suggestionRequestId.current === requestId) {
             setSuggestions(results)
             setShowSuggestions(true)
+            setSuggestionsLoading(false)
           }
         })
-        .catch(() => {})
+        .catch(() => {
+          if (suggestionRequestId.current === requestId) {
+            setSuggestionsLoading(false)
+          }
+        })
     }, SUGGESTION_DEBOUNCE_MS)
     return () => clearTimeout(timer)
   }, [searchText, searchType])
+
+  // 검색 유형을 바꾸는 순간 이전 유형의 자동완성 결과(제목이면 영화 객체 배열, 배우/감독이면 이름
+  // 문자열 배열)를 바로 비웁니다 - 안 그러면 드롭다운이 열려 있는 채로 유형만 바뀔 때, 아직 새
+  // 유형의 응답이 도착하기 전까지 잠깐이라도 이전 유형의 데이터를 지금 유형의 렌더링 방식으로
+  // 그리려다(예: 영화 객체를 배우/감독 분기의 <span>{suggestion}</span>에 그대로 넣음) React가
+  // "객체는 자식으로 렌더링할 수 없다" 에러를 던지며 화면이 멈추는 문제가 있었습니다.
+  const handleSearchTypeChange = (value) => {
+    setSearchType(value)
+    setSuggestions([])
+    setShowSuggestions(false)
+    setSuggestionsLoading(false)
+  }
 
   const handleLogout = () => {
     logout()
@@ -100,15 +149,50 @@ function Header() {
       navigate(`/movies/${encodeURIComponent(suggestion.id)}`)
       return
     }
+    programmaticText.current = suggestion
+    typedText.current = suggestion
     setSearchText(suggestion)
     navigate(`/movies?query=${encodeURIComponent(suggestion)}&field=${searchType}`)
+  }
+
+  // ↓/↑로 후보를 오가고(끝에서 순환), 하이라이트된 상태의 Enter는 그 후보를 선택합니다.
+  const handleSearchKeyDown = (event) => {
+    const listOpen = showSuggestions && suggestions.length > 0
+    if (event.key === 'Escape') {
+      setShowSuggestions(false)
+      if (activeIndex >= 0) {
+        programmaticText.current = typedText.current
+        setSearchText(typedText.current)
+      }
+    } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      if (suggestions.length === 0) return
+      event.preventDefault()
+      if (!listOpen) {
+        setShowSuggestions(true)
+        return
+      }
+      const last = suggestions.length - 1
+      const next =
+        event.key === 'ArrowDown'
+          ? activeIndex >= last ? 0 : activeIndex + 1
+          : activeIndex <= 0 ? last : activeIndex - 1
+      setActiveIndex(next)
+      // 검색창에도 하이라이트된 후보의 글자를 바로 보여줍니다.
+      const picked = suggestions[next]
+      const pickedText = searchType === 'title' ? picked.title : picked
+      programmaticText.current = pickedText
+      setSearchText(pickedText)
+    } else if (event.key === 'Enter' && listOpen && activeIndex >= 0) {
+      event.preventDefault()
+      handleSuggestionClick(suggestions[activeIndex])
+    }
   }
 
   const searchForm = (
     <form onSubmit={handleSearchSubmit} className="flex flex-1 items-center gap-2">
       <select
         value={searchType}
-        onChange={(event) => setSearchType(event.target.value)}
+        onChange={(event) => handleSearchTypeChange(event.target.value)}
         className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-gray-300 focus:outline-none"
       >
         {SEARCH_TYPES.map((type) => (
@@ -123,28 +207,54 @@ function Header() {
           name="query"
           type="text"
           value={searchText}
-          onChange={(event) => setSearchText(event.target.value)}
+          onChange={(event) => {
+            typedText.current = event.target.value
+            programmaticText.current = null
+            setSearchText(event.target.value)
+          }}
           onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
           // 드롭다운 항목 클릭(mousedown)이 이 blur보다 먼저 일어나도록 click 대신 onMouseDown에서
           // 처리하므로, 여기서 바로 닫아도 클릭이 씹히지 않습니다.
           onBlur={() => setShowSuggestions(false)}
-          onKeyDown={(event) => event.key === 'Escape' && setShowSuggestions(false)}
+          onKeyDown={handleSearchKeyDown}
+          role="combobox"
+          aria-expanded={showSuggestions && (suggestionsLoading || suggestions.length > 0)}
+          aria-autocomplete="list"
           autoComplete="off"
           placeholder={`${selectedSearchType.label}${selectedSearchType.particle} 입력해주세요`}
           className="w-full bg-transparent text-gray-100 placeholder:text-gray-500 focus:outline-none"
         />
 
-        {showSuggestions && suggestions.length > 0 && (
-          <ul className="absolute left-0 right-0 top-full z-30 mt-2 overflow-hidden rounded-lg border border-white/10 bg-slate-900 shadow-lg">
-            {suggestions.map((suggestion) => (
-              <li key={searchType === 'title' ? suggestion.id : suggestion}>
+        {showSuggestions && (suggestionsLoading || suggestions.length > 0) && (
+          <ul
+            role="listbox"
+            className="absolute left-0 right-0 top-full z-30 mt-2 overflow-hidden rounded-lg border border-white/10 bg-slate-900 shadow-lg"
+          >
+            {suggestionsLoading ? (
+              // 배우/감독 자동완성은 KMDB를 직접 조회해 제목보다 눈에 띄게 느릴 수 있어, 응답을
+              // 기다리는 동안 "멈춘 게 아니다"를 알려주는 로딩 표시입니다.
+              <li className="flex items-center gap-2 px-3 py-2 text-sm text-gray-400">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-gray-500 border-t-gray-200" />
+                검색 중...
+              </li>
+            ) : (
+              suggestions.map((suggestion, index) => (
+              <li
+                key={searchType === 'title' ? suggestion.id : suggestion}
+                role="option"
+                aria-selected={index === activeIndex}
+              >
                 <button
                   type="button"
+                  tabIndex={-1}
+                  onMouseEnter={() => setActiveIndex(index)}
                   onMouseDown={(event) => {
                     event.preventDefault()
                     handleSuggestionClick(suggestion)
                   }}
-                  className="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-gray-200 hover:bg-slate-800"
+                  className={`flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-gray-200 hover:bg-slate-800 ${
+                    index === activeIndex ? 'bg-slate-800' : ''
+                  }`}
                 >
                   {searchType === 'title' ? (
                     <>
@@ -156,7 +266,8 @@ function Header() {
                   )}
                 </button>
               </li>
-            ))}
+              ))
+            )}
           </ul>
         )}
       </div>
@@ -186,14 +297,14 @@ function Header() {
           ))}
         </nav>
 
-        <div className="ml-4 hidden max-w-xl flex-1 md:flex">{searchForm}</div>
+        {isDesktop && <div className="ml-4 flex max-w-xl flex-1">{searchForm}</div>}
 
         <div className="ml-auto hidden items-center gap-4 md:flex">
           {/* 화면 폭별 표시: 1100px 이상은 188px 로 넓게 채우고, 900~1099px 은 글자를 16px 로 줄여 작게 표시하며,
               900px 보다 좁으면 숨깁니다(그 폭에서는 배지 때문에 메뉴/로그아웃 글자가 세로로 꺾이기 때문). */}
           <VersionBadge className="block shrink-0 min-[1100px]:w-[188px] max-[1100px]:text-[16px] max-[900px]:hidden" />
           <ThemeToggle />
-          <NotificationBell />
+          {isDesktop && <NotificationBell />}
           <span className="text-sm text-gray-400">{user?.nickname}</span>
           <NavLink to="/mypage" aria-label="마이페이지">
             <span className="block h-8 w-8 rounded-full bg-gradient-to-br from-orange-400 to-red-500" />
@@ -206,7 +317,7 @@ function Header() {
         {/* md 미만(모바일)에서만 보이는 햄버거 - 내비/검색/사용자 메뉴를 전부 아래 펼침 패널로 옮깁니다. */}
         <div className="ml-auto flex items-center gap-3 md:hidden">
           <ThemeToggle />
-          <NotificationBell />
+          {!isDesktop && <NotificationBell />}
           <button
             type="button"
             onClick={() => setMenuOpen((open) => !open)}

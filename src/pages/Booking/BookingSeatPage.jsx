@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useAuth } from '../../auth/AuthContext'
 import { getMovieDetail } from '../../api/movieApi'
 import { getScreenings, getScreeningSeats, holdSeat, releaseSeatHold } from '../../api/screeningApi'
@@ -7,6 +7,7 @@ import { createBooking } from '../../api/bookingApi'
 import PosterPlaceholder from '../../components/common/PosterPlaceholder'
 import ConfirmDialog from '../../components/common/ConfirmDialog'
 import InfoDialog from '../../components/common/InfoDialog'
+import MovieTicketDialog from '../../components/common/MovieTicketDialog'
 import SeatMap from './components/SeatMap'
 import TossPaymentWidget from './components/TossPaymentWidget'
 import {
@@ -51,6 +52,13 @@ function isBookable(screening) {
 // 패턴을 그대로 따릅니다.
 const SEAT_POLL_INTERVAL_MS = 5000
 
+// 좌석 선점 카운트다운 표시용 - "4:32"처럼 분:초로 보여줍니다.
+function formatCountdown(totalSeconds) {
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
 function PillButton({ active, onClick, children }) {
   return (
     <button
@@ -67,6 +75,7 @@ function PillButton({ active, onClick, children }) {
 
 function BookingSeatPage() {
   const { id } = useParams()
+  const navigate = useNavigate()
   const { user } = useAuth()
   const [movie, setMovie] = useState(null)
   // 실제 상영정보(매주 월요일 자정 배치가 생성해둔 이번 주 분량) - 지난 회차는 예매 대상이 아니라 미리 거릅니다.
@@ -95,6 +104,44 @@ function BookingSeatPage() {
   const [showTeenAgeConfirm, setShowTeenAgeConfirm] = useState(false)
   const [showPaymentConfirm, setShowPaymentConfirm] = useState(false)
   const [resultDialog, setResultDialog] = useState(null) // { title, message, tone }
+  // 결제가 성공하면 텍스트 안내 대신 실제 모바일 영화 티켓처럼 보이는 모달을 띄웁니다.
+  const [completedBooking, setCompletedBooking] = useState(null)
+  // 좌석 선점 카운트다운 - 1초마다 갱신해 "남은 시간"을 실시간으로 보여줍니다.
+  const [now, setNow] = useState(() => Date.now())
+  // 선점 만료 1분 전 토스트 안내 - WishlistContext.jsx의 하단 토스트와 같은 패턴입니다.
+  const [expiryToastMessage, setExpiryToastMessage] = useState(null)
+  const expiryToastTimerRef = useRef(null)
+  // 같은 선점 건에 대해 1분 경고를 한 번만 울리기 위한 플래그 - holdDeadline이 바뀌면(새로 좌석을
+  // 선택하면) 다시 울릴 수 있도록 리셋됩니다.
+  const hasWarnedExpiryRef = useRef(false)
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => () => clearTimeout(expiryToastTimerRef.current), [])
+
+  // 사운드 재생용 오디오 파일을 따로 두지 않고, Web Audio API로 짧은 비프음을 그 자리에서 만들어
+  // 냅니다 - 브라우저 자동재생 정책 때문에 실패할 수 있는데(예: 아직 페이지와 상호작용이 없었던 경우),
+  // 그 경우는 토스트만으로도 충분하니 조용히 무시합니다.
+  const playExpiryBeep = () => {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext
+      const ctx = new AudioContextClass()
+      const oscillator = ctx.createOscillator()
+      const gain = ctx.createGain()
+      oscillator.type = 'sine'
+      oscillator.frequency.value = 880
+      gain.gain.setValueAtTime(0.15, ctx.currentTime)
+      oscillator.connect(gain)
+      gain.connect(ctx.destination)
+      oscillator.start()
+      oscillator.stop(ctx.currentTime + 0.3)
+    } catch {
+      // 조용히 무시 - 알림은 토스트로도 충분합니다.
+    }
+  }
 
   // 페이지 이동 시 맨 위로 스크롤하는 건 App.jsx의 전역 ScrollToTop이 처리합니다(라우트가
   // /booking/:id라 영화를 바꿔도 경로 자체가 바뀌어 거기서 함께 처리됩니다).
@@ -259,7 +306,10 @@ function BookingSeatPage() {
       return
     }
     try {
-      await holdSeat(screeningId, seat.id, user.id)
+      const held = await holdSeat(screeningId, seat.id, user.id)
+      // 선점 응답에 담긴 heldUntil을 바로 반영해야, 다음 폴링(최대 5초)을 기다리지 않고도 카운트다운이
+      // 선택 즉시 나타납니다.
+      setSeats((prev) => prev.map((candidate) => (candidate.id === held.id ? held : candidate)))
       setSelectedSeats((prev) => [...prev, seat.id])
     } catch (error) {
       setResultDialog({ title: '선택할 수 없는 좌석이에요', message: error.message, tone: 'error' })
@@ -321,6 +371,19 @@ function BookingSeatPage() {
   const holidayPricing = showDate ? isWeekendOrHoliday(showDate) : false
   const timePeriod = timePeriodFor(showtime)
   const totalTickets = Object.values(ticketCounts).reduce((sum, count) => sum + count, 0)
+
+  // 인원수를 줄였는데 이미 선택해둔 좌석 수가 더 많으면, 가장 나중에 선택한 좌석부터 자동으로
+  // 선점을 풀어줍니다 - 그대로 두면 좌석은 계속 "선택됨"으로 남는데 결제 버튼만 막혀서, 어떤
+  // 좌석을 빼야 하는지 사용자가 직접 알아내야 했습니다.
+  useEffect(() => {
+    const excessCount = selectedSeatsRef.current.length - totalTickets
+    if (excessCount <= 0) return
+    const released = selectedSeatsRef.current.slice(-excessCount)
+    setSelectedSeats((prev) => prev.slice(0, prev.length - excessCount))
+    released.forEach((seatId) => releaseSeatHold(screeningId, seatId, user.id).catch(() => {}))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [totalTickets])
+
   const totalPrice = AGE_CATEGORIES.reduce(
     (sum, category) => sum + ticketCounts[category.key] * priceFor(category.key, showDate, showtime),
     0,
@@ -332,18 +395,55 @@ function BookingSeatPage() {
     .filter(Boolean)
     .map((seat) => `${seat.rowLabel}${seat.colNo}`)
 
+  // 좌석 선점 남은 시간 - 내가 선점 중인 좌석들의 heldUntil 중 가장 빠른 시각을 기준으로 삼습니다
+  // (보통 거의 같은 시각이지만, 혹시 어긋나더라도 가장 먼저 만료되는 좌석을 기준으로 보여줘야 안전합니다).
+  const myHeldUntilTimestamps = seats
+    .filter((seat) => selectedSeats.includes(seat.id) && seat.heldByMe && seat.heldUntil)
+    .map((seat) => new Date(seat.heldUntil).getTime())
+  const holdDeadline = myHeldUntilTimestamps.length > 0 ? Math.min(...myHeldUntilTimestamps) : null
+  const remainingSeconds = holdDeadline != null ? Math.max(0, Math.round((holdDeadline - now) / 1000)) : null
+
+  // 선점 만료 1분 전에 토스트 + 비프음으로 한 번 더 알려줍니다 - 화면에 작게 줄어드는 숫자만으로는
+  // 결제에 열중하다 놓치기 쉽습니다. 같은 선점 건에서는 한 번만 울리고, 좌석을 다시 선택해 새 선점이
+  // 생기면(remainingSeconds가 null을 거쳐갔다가 다시 생기면) 또 울릴 수 있게 리셋합니다.
+  useEffect(() => {
+    if (remainingSeconds == null) {
+      hasWarnedExpiryRef.current = false
+      return
+    }
+    if (remainingSeconds <= 60 && remainingSeconds > 0 && !hasWarnedExpiryRef.current) {
+      hasWarnedExpiryRef.current = true
+      setExpiryToastMessage('⏱ 좌석 선점이 곧 만료됩니다! 1분 안에 결제를 완료해주세요.')
+      clearTimeout(expiryToastTimerRef.current)
+      expiryToastTimerRef.current = setTimeout(() => setExpiryToastMessage(null), 4000)
+      playExpiryBeep()
+    }
+  }, [remainingSeconds])
+
+  // 선점 갱신(5초 폴링)이 어떤 이유로든 실패해 카운트다운이 정말 0에 도달하면, 선택을 초기화하고
+  // 다시 고르게 안내합니다. 결제 요청이 이미 진행 중일 때는 건드리지 않습니다(제출 도중 좌석이
+  // 사라지면 더 혼란스럽습니다).
+  useEffect(() => {
+    if (isSubmitting) return
+    if (remainingSeconds !== 0) return
+    setSelectedSeats([])
+    setShowPaymentWidget(false)
+    setResultDialog({
+      title: '좌석 선점 시간이 만료됐어요',
+      message: '선택해두신 좌석의 선점 시간이 지나 선택이 초기화되었습니다. 다시 선택해주세요.',
+      tone: 'error',
+    })
+    refreshSeats()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remainingSeconds, isSubmitting])
+
   // 결제위젯의 "결제하기"는 토스 실제 결제창으로 넘어가지 않고, 이 자리에서 바로 예매를 생성합니다
   // (결제수단 선택 UI는 테스트/데모용으로 그대로 보여주되, 실제 결제 승인 절차는 거치지 않습니다).
   const handlePaymentComplete = async () => {
     setIsSubmitting(true)
     try {
       const booking = await createBooking(user.id, { screeningId, seatIds: selectedSeats, ticketCounts })
-      setResultDialog({
-        title: '결제가 완료됐어요 🎬',
-        message:
-          `"${booking.movieTitle}" ${booking.theaterName} ${booking.showDate} ${booking.showtime}\n` +
-          `좌석: ${booking.seats.join(', ')} · ${booking.totalPrice.toLocaleString()}원`,
-      })
+      setCompletedBooking(booking)
       setSelectedSeats([])
       setTicketCounts({ adult: 0, teen: 0, child: 0, senior: 0 })
       setShowPaymentWidget(false)
@@ -479,7 +579,7 @@ function BookingSeatPage() {
                           <div className="flex items-center gap-3">
                             <button
                               type="button"
-                              disabled={disallowed || showPaymentWidget}
+                              disabled={disallowed || showPaymentWidget || ticketCounts[category.key] === 0}
                               onClick={() => updateTicketCount(category.key, -1)}
                               className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-800 text-gray-300 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                             >
@@ -509,6 +609,16 @@ function BookingSeatPage() {
                 <div className={`py-8 ${showPaymentWidget ? 'pointer-events-none opacity-60' : ''}`}>
                   <SeatMap seats={seats} selectedSeats={selectedSeats} onToggleSeat={toggleSeat} />
                 </div>
+
+                {remainingSeconds != null && (
+                  <p
+                    className={`mt-4 flex items-center gap-1.5 text-sm font-semibold ${
+                      remainingSeconds <= 60 ? 'animate-pulse text-rose-400' : 'text-amber-400'
+                    }`}
+                  >
+                    ⏱ 좌석 선점 남은 시간 {formatCountdown(remainingSeconds)}
+                  </p>
+                )}
 
                 <div className="flex flex-col gap-4 border-t border-white/10 pt-6 sm:flex-row sm:items-center sm:justify-between">
                   <div>
@@ -593,6 +703,26 @@ function BookingSeatPage() {
           tone={resultDialog.tone}
           onClose={() => setResultDialog(null)}
         />
+      )}
+
+      {completedBooking && (
+        <MovieTicketDialog
+          booking={completedBooking}
+          confirmLabel="확인"
+          onClose={() => {
+            setCompletedBooking(null)
+            // 예매 완료 직후 "확인"을 누르면 마이페이지의 예매 내역 탭(기본 탭)으로 이동합니다.
+            navigate('/mypage')
+          }}
+        />
+      )}
+
+      {expiryToastMessage && (
+        <div className="pointer-events-none fixed inset-x-0 bottom-8 z-[100] flex justify-center px-4">
+          <div className="rounded-full bg-rose-600/95 px-5 py-2.5 text-sm font-semibold text-white shadow-lg ring-1 ring-white/10">
+            {expiryToastMessage}
+          </div>
+        </div>
       )}
     </div>
   )
